@@ -1220,13 +1220,27 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 // picture showed for the whole copy: a full-screen flash on Launchpad and while scrolling. Bit 1: with a zero-copy surface
 // on the panel the boot scanout is offscreen, so the frame is written into it first and the panel flips home after. Bit 2:
 // with the boot scanout on the panel, the frame is written into the surface's own VRAM (its CPU mapping) and that is
-// flipped instead -- never while that surface is the one on the panel or a flip is in flight. 0 = the upstream behaviour.
-static int gIopUnwrittenFix = 3;
+// flipped instead -- never while that surface is the one on the panel or a flip is in flight. Bit 4: the plugin copies
+// such a frame out to system memory only after it has released the surface's pending mark (nvmtl_ws_release, then
+// nvmtl_ws_publish_settled), so a swap can get here before the copy, when system memory still holds what the surface
+// showed last time -- seconds or minutes old. The copy-out's write unlock moves the surface's unlock seed, so the frame
+// is shown only once that seed has moved past the one shown last (waited for up to kIopUwWaitMs); a frame whose pixels
+// do not arrive keeps the previous picture on the panel. 0 = the upstream behaviour.
+static int gIopUnwrittenFix = 7;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_unwritten_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopUnwrittenFix, 0,
-           "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM and flip them, 0 = upstream");
+           "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM and flip them, 4 = wait for the plugin's copy-out (unlock seed) and keep stale frames off the panel, 0 = upstream");
 static SInt64 gCntIopHomeAfterCopy, gCntIopUnwrittenUpload, gCntIopUnwrittenUploadUs, gCntIopUnwrittenNoKva;
 static unsigned gIopUploadSlowRuns;
 static bool gIopUploadSlow;
+extern "C" {
+uint32_t _ZNK9IOSurface11getLockSeedEv(void *surface);
+uint32_t _ZNK9IOSurface13getUnlockSeedEv(void *surface);
+}
+enum { kIopUwSlots = 4, kIopUwWaitMs = 30 };
+struct NVIopUwSeen { unsigned id; uint32_t seed; };   // an unwritten surface and the unlock seed it was last shown at
+static NVIopUwSeen gIopUwSeen[kNvMaxFB][kIopUwSlots];
+static unsigned gIopUwNext[kNvMaxFB];
+static SInt64 gCntIopUwFresh, gCntIopUwStaleKept, gCntIopUwWaits, gCntIopUwWaitMs, gCntIopUwChecked;
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -1332,6 +1346,29 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // Such a frame now keeps the previous picture on the panel instead.
         nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+        if (uvm && (gIopUnwrittenFix & 4)) {   // NullMoth fork: wait for the plugin's copy-out of this frame (gIopUnwrittenFix)
+            const unsigned sid = s->getSurfaceID();
+            NVIopUwSeen *e = nullptr;
+            for (unsigned i = 0; i < kIopUwSlots; i++) if (gIopUwSeen[head][i].id == sid) { e = &gIopUwSeen[head][i]; break; }
+            const bool known = e != nullptr;
+            if (!e) { e = &gIopUwSeen[head][gIopUwNext[head]++ % kIopUwSlots]; e->id = sid; e->seed = 0; }
+            const uint32_t lock0 = _ZNK9IOSurface11getLockSeedEv((void *)s), seed0 = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
+            uint32_t seed = seed0;
+            bool fresh = known && seed0 != e->seed;
+            unsigned waited = 0;
+            while (!fresh && waited < kIopUwWaitMs) {
+                IOSleep(1); waited++;
+                seed = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
+                if (seed != seed0) fresh = true;
+            }
+            if (waited) { OSAddAtomic64(1, &gCntIopUwWaits); OSAddAtomic64((SInt64)waited, &gCntIopUwWaitMs); }
+            if (OSAddAtomic64(1, &gCntIopUwChecked) < 8)
+                ALOG("iop: unwritten-fix: surface 0x%x lock seed %u unlock seed %u (shown %u%s), waited %u ms -> %s", sid, lock0, seed0,
+                     e->seed, known ? "" : ", first sight", waited, fresh ? "fresh" : known ? "stale, kept off the panel" : "shown as it is");
+            if (!fresh && known) { OSAddAtomic64(1, &gCntIopUwStaleKept); return kIOReturnSuccess; }
+            e->seed = seed;
+            if (fresh) OSAddAtomic64(1, &gCntIopUwFresh);
+        }
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -1504,6 +1541,10 @@ NVACCEL_CNT(nvaccel_iop_home_after_copy,     gCntIopHomeAfterCopy,     "NullMoth
 NVACCEL_CNT(nvaccel_iop_unwritten_upload,    gCntIopUnwrittenUpload,   "NullMoth fork: unwritten frames written into their own VRAM and flipped");
 NVACCEL_CNT(nvaccel_iop_unwritten_upload_us, gCntIopUnwrittenUploadUs, "NullMoth fork: microseconds those writes took");
 NVACCEL_CNT(nvaccel_iop_unwritten_nokva,     gCntIopUnwrittenNoKva,    "NullMoth fork: unwritten frames whose VRAM has no CPU mapping (they go through the boot scanout)");
+NVACCEL_CNT(nvaccel_iop_unwritten_fresh,     gCntIopUwFresh,           "NullMoth fork: unwritten frames shown after the plugin's copy-out moved the unlock seed");
+NVACCEL_CNT(nvaccel_iop_unwritten_stale_kept, gCntIopUwStaleKept,      "NullMoth fork: unwritten frames kept off the panel: no copy-out arrived in time, system memory held an old frame");
+NVACCEL_CNT(nvaccel_iop_unwritten_waits,     gCntIopUwWaits,           "NullMoth fork: unwritten frames that waited for the copy-out");
+NVACCEL_CNT(nvaccel_iop_unwritten_wait_ms,   gCntIopUwWaitMs,          "NullMoth fork: milliseconds those waits took");
 // The two decisions the display pipe makes from the family's validity bits, kept as pure functions so they can be
 // exercised outside the kernel (tools/test_iop_flip_gate.py). vramNewest is the family's bit (valid[6] & plane);
 // sysmemCurrent is valid[0] & plane; pluginWrote is nvAccelPluginWrote(): the resource's recorded write cookie equals the
@@ -1640,6 +1681,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_fix);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_home_after_copy);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload); sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_nokva);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_fresh);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_stale_kept);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_waits);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_wait_ms);
     ALOG("NullMoth fork (vgearen): unwritten-frame flash fix compiled in, debug.nvaccel_iop_unwritten_fix=%d", gIopUnwrittenFix);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_head);       sysctl_register_oid(&sysctl__debug_nvaccel_crc);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);

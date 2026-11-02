@@ -1224,8 +1224,10 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 // such a frame out to system memory only after it has released the surface's pending mark (nvmtl_ws_release, then
 // nvmtl_ws_publish_settled), so a swap can get here before the copy, when system memory still holds what the surface
 // showed last time -- seconds or minutes old. The copy-out's write unlock moves the surface's unlock seed, so the frame
-// is shown only once that seed has moved past the one shown last (waited for up to kIopUwWaitMs); a frame whose pixels
-// do not arrive keeps the previous picture on the panel. 0 = the upstream behaviour.
+// is shown only once that seed has moved past the one shown last; a frame whose pixels do not arrive keeps the previous
+// picture on the panel. Measured with DTrace on an RTX 2080 at 4K: the swap arrives, the plugin's write lock follows 1-3 ms
+// later and its unlock 20-23 ms later (the first copy-out of a session 124 ms later), while the old code had read the
+// surface within 6-10 ms in all 59 frames. 0 = the upstream behaviour.
 static int gIopUnwrittenFix = 7;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_unwritten_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopUnwrittenFix, 0,
            "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM and flip them, 4 = wait for the plugin's copy-out (unlock seed) and keep stale frames off the panel, 0 = upstream");
@@ -1236,7 +1238,7 @@ extern "C" {
 uint32_t _ZNK9IOSurface11getLockSeedEv(void *surface);
 uint32_t _ZNK9IOSurface13getUnlockSeedEv(void *surface);
 }
-enum { kIopUwSlots = 4, kIopUwWaitMs = 30 };
+enum { kIopUwSlots = 4, kIopUwWaitMs = 50, kIopUwFirstWaitMs = 150 };   // a copy-out took 20-23 ms, a session's first one 124 ms
 struct NVIopUwSeen { unsigned id; uint32_t seed; };   // an unwritten surface and the unlock seed it was last shown at
 static NVIopUwSeen gIopUwSeen[kNvMaxFB][kIopUwSlots];
 static unsigned gIopUwNext[kNvMaxFB];
@@ -1356,17 +1358,22 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
             uint32_t seed = seed0;
             bool fresh = known && seed0 != e->seed;
             unsigned waited = 0;
-            while (!fresh && waited < kIopUwWaitMs) {
-                IOSleep(1); waited++;
+            const unsigned bound = known ? kIopUwWaitMs : kIopUwFirstWaitMs;
+            const uint64_t w0 = mach_absolute_time();
+            uint64_t wns = 0;
+            while (!fresh && wns < bound * 1000000ull) {
+                IOSleep(1);
                 seed = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
                 if (seed != seed0) fresh = true;
+                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &wns);
             }
-            if (waited) { OSAddAtomic64(1, &gCntIopUwWaits); OSAddAtomic64((SInt64)waited, &gCntIopUwWaitMs); }
+            waited = (unsigned)(wns / 1000000ull);
+            if (wns) { OSAddAtomic64(1, &gCntIopUwWaits); OSAddAtomic64((SInt64)waited, &gCntIopUwWaitMs); }
             if (OSAddAtomic64(1, &gCntIopUwChecked) < 8)
                 ALOG("iop: unwritten-fix: surface 0x%x lock seed %u unlock seed %u (shown %u%s), waited %u ms -> %s", sid, lock0, seed0,
-                     e->seed, known ? "" : ", first sight", waited, fresh ? "fresh" : known ? "stale, kept off the panel" : "shown as it is");
-            if (!fresh && known) { OSAddAtomic64(1, &gCntIopUwStaleKept); return kIOReturnSuccess; }
+                     e->seed, known ? "" : ", first sight", waited, fresh ? "fresh" : "stale, kept off the panel");
             e->seed = seed;
+            if (!fresh) { OSAddAtomic64(1, &gCntIopUwStaleKept); return kIOReturnSuccess; }   // the panel keeps its picture
             if (fresh) OSAddAtomic64(1, &gCntIopUwFresh);
         }
         const unsigned fmt = s->getPixelFormat();

@@ -1213,6 +1213,20 @@ public:
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopOkHead[kNvMaxFB];
+// NullMoth fork (vgearen, 2026-11): frames the plugin never wrote. CoreDisplay's fallback GPU display pipe renders into a
+// surface whose family VRAM the plugin could not import (BAR1 full at login: "family VRAM import refused - private image +
+// copies"), so the plugin copies each frame out to system memory and never marks that VRAM. Such a frame was put on the
+// panel by flipping home to the boot scanout first and then writing ~33 MB into it with the CPU, so the boot scanout's old
+// picture showed for the whole copy: a full-screen flash on Launchpad and while scrolling. Bit 1: with a zero-copy surface
+// on the panel the boot scanout is offscreen, so the frame is written into it first and the panel flips home after. Bit 2:
+// with the boot scanout on the panel, the frame is written into the surface's own VRAM (its CPU mapping) and that is
+// flipped instead -- never while that surface is the one on the panel or a flip is in flight. 0 = the upstream behaviour.
+static int gIopUnwrittenFix = 3;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_unwritten_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopUnwrittenFix, 0,
+           "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM and flip them, 0 = upstream");
+static SInt64 gCntIopHomeAfterCopy, gCntIopUnwrittenUpload, gCntIopUnwrittenUploadUs, gCntIopUnwrittenNoKva;
+static unsigned gIopUploadSlowRuns;
+static bool gIopUploadSlow;
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -1265,7 +1279,10 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+class NVVidMemory;
+static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, bool uploaded = false,
+                           NVVidMemory **unwrittenVm = nullptr, unsigned long long *unwrittenBytes = nullptr);
+static bool nvAccelIopPanelOnSurface(unsigned head, IOSurface *s);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
@@ -1296,6 +1313,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
              res ? *(const volatile unsigned int *)(kr + 0xb8) : 0u, res ? *(const volatile unsigned int *)(kr + 0xc0) : 0u,
              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
     }
+    NVVidMemory *uvm = nullptr; unsigned long long ubytes = 0;   // set when the surface's VRAM was never written by the plugin
     if (!s && vm && vm->fKva) {
         const unsigned char *rr = (const unsigned char *)res;
         w     = *(const volatile unsigned short *)(rr + 0xb0);
@@ -1304,7 +1322,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+    } else if (s && nvAccelIopFlip(fb, head, s, this, false, &uvm, &ubytes)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
@@ -1324,6 +1342,31 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         src = (const volatile unsigned int *)iopMapSurface(s->getSurfaceID(), md, H * P);
         if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
         w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
+        if (uvm && (gIopUnwrittenFix & 2)) {
+            if (!uvm->fKva) OSAddAtomic64(1, &gCntIopUnwrittenNoKva);
+            else if (!gIopUploadSlow && H * P <= ubytes && !nvAccelIopPanelOnSurface(head, s) && !nvAccelIopAsyncBusy(this)) {
+                uint64_t t0 = mach_absolute_time(), ns = 0;
+                const unsigned long long nw = (H * P) / 4;
+                volatile unsigned int *dv = (volatile unsigned int *)uvm->fKva;
+                for (unsigned long long i = 0; i < nw; i++) dv[i] = src[i];
+                absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+                const SInt64 us = (SInt64)(ns / 1000);
+                OSAddAtomic64(us, &gCntIopUnwrittenUploadUs);
+                if (us > 25000) {
+                    if (++gIopUploadSlowRuns >= 3) {
+                        gIopUploadSlow = true;
+                        ALOG("iop: unwritten-fix: an upload into VRAM took %lld us -- uploads off, such frames go through the boot scanout", (long long)us);
+                    }
+                } else gIopUploadSlowRuns = 0;
+                if (nvAccelIopFlip(fb, head, s, this, true)) {
+                    const SInt64 nu = OSAddAtomic64(1, &gCntIopUnwrittenUpload);
+                    if (nu < 3) ALOG("iop: unwritten-fix: surface 0x%x written into its own VRAM (%llu bytes, %lld us) and flipped",
+                                     s->getSurfaceID(), H * P, (long long)us);
+                    OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+                    return kIOReturnSuccess;
+                }
+            }
+        }
     } else {
         NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
     }
@@ -1336,7 +1379,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
 
-    nvAccelIopHome(fb, head);
+    // NullMoth fork: with a zero-copy surface on the panel the boot scanout is offscreen, so the frame is written into it
+    // first and the panel flips home to a complete picture (flipping home first showed its old one for the whole copy)
+    const bool homeAfter = (gIopUnwrittenFix & 1) && nvAccelIopPanelOnSurface(head, nullptr);
+    if (!homeAfter) nvAccelIopHome(fb, head);
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
@@ -1344,6 +1390,11 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+    }
+    if (homeAfter) {
+        nvAccelIopHome(fb, head);
+        const SInt64 nh2 = OSAddAtomic64(1, &gCntIopHomeAfterCopy);
+        if (nh2 < 3) ALOG("iop: unwritten-fix: frame written into the offscreen boot scanout, then flipped home (head %u)", head);
     }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
@@ -1449,6 +1500,10 @@ NVACCEL_CNT(nvaccel_iop_flip_refused, gCntIopFlipNo[7],   "copied because the fr
 static SInt64 gCntIopUnwritten, gCntIopCopyUnwritten;
 NVACCEL_CNT(nvaccel_iop_flip_unwritten, gCntIopUnwritten,     "copied because the family marked VRAM newest on a copy the plugin never wrote");
 NVACCEL_CNT(nvaccel_iop_copy_unwritten, gCntIopCopyUnwritten, "copied frames that skipped the page-off because the plugin never wrote the VRAM copy");
+NVACCEL_CNT(nvaccel_iop_home_after_copy,     gCntIopHomeAfterCopy,     "NullMoth fork: copied frames written while the boot scanout was offscreen, then flipped home");
+NVACCEL_CNT(nvaccel_iop_unwritten_upload,    gCntIopUnwrittenUpload,   "NullMoth fork: unwritten frames written into their own VRAM and flipped");
+NVACCEL_CNT(nvaccel_iop_unwritten_upload_us, gCntIopUnwrittenUploadUs, "NullMoth fork: microseconds those writes took");
+NVACCEL_CNT(nvaccel_iop_unwritten_nokva,     gCntIopUnwrittenNoKva,    "NullMoth fork: unwritten frames whose VRAM has no CPU mapping (they go through the boot scanout)");
 // The two decisions the display pipe makes from the family's validity bits, kept as pure functions so they can be
 // exercised outside the kernel (tools/test_iop_flip_gate.py). vramNewest is the family's bit (valid[6] & plane);
 // sysmemCurrent is valid[0] & plane; pluginWrote is nvAccelPluginWrote(): the resource's recorded write cookie equals the
@@ -1582,6 +1637,10 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_unwritten); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_unwritten);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_refused);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_fix);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_home_after_copy);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload); sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_nokva);
+    ALOG("NullMoth fork (vgearen): unwritten-frame flash fix compiled in, debug.nvaccel_iop_unwritten_fix=%d", gIopUnwrittenFix);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_head);       sysctl_register_oid(&sysctl__debug_nvaccel_crc);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
@@ -2172,7 +2231,8 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
     thread_call_enter(e->call);
     return true;
 }
-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
+static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, bool uploaded,
+                           NVVidMemory **unwrittenVm, unsigned long long *unwrittenBytes)
 {
     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
     // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
@@ -2202,11 +2262,14 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!vramNewest) return nvAccelIopFlipNo(5);
     // Checked against the allocation this flip submits (vm, resolved above and cached), not re-resolved from the
     // resource: this runs outside the family lock, and the record must describe the VRAM that is about to be scanned.
-    if (!nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) {
+    // uploaded: the caller has just written this frame's system-memory pixels (the plugin's copy-out) into vm, so vm holds
+    // the newest frame although the plugin never marked it (NullMoth fork, gIopUnwrittenFix bit 2)
+    if (!uploaded && !nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) {
         const SInt64 n = OSAddAtomic64(1, &gCntIopUnwritten);
         if (n < 4 || (n & 0xfff) == 0)
-            ALOG("iop: surface 0x%x: VRAM marked newest but the plugin never wrote it -- copying its system memory instead of flipping (%lld so far)",
-                 s->getSurfaceID(), (long long)n + 1);
+            ALOG("iop: surface 0x%x: VRAM marked newest but the plugin never wrote it -- copying its system memory instead of flipping (%lld so far, VRAM CPU mapping %s)",
+                 s->getSurfaceID(), (long long)n + 1, vm->fKva ? "yes" : "no");
+        if (unwrittenVm) { *unwrittenVm = vm; if (unwrittenBytes) *unwrittenBytes = bytes; }
         return false;
     }
     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -2264,6 +2327,12 @@ static void nvAccelIopHome(IOService *fb, unsigned head)
     if (rr == kIOReturnBusy) return;
     if (rr != kIOReturnSuccess && gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: HOME flip refused (0x%x) head %u", (unsigned)rr, head); }
     gIopFlipped[head] = false;
+}
+// NullMoth fork: a zero-copy surface is on the panel -- s, or any one when s is null; the boot scanout is then offscreen
+static bool nvAccelIopPanelOnSurface(unsigned head, IOSurface *s)
+{
+    if (head >= kNvMaxFB || !gIopFlipped[head]) return false;
+    return !s || gIopFlipFront[head] == s;
 }
 static void nvAccelSurfScanoutSync(IOSurface *s)
 {

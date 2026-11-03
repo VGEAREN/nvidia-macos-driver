@@ -1220,29 +1220,79 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 // picture showed for the whole copy: a full-screen flash on Launchpad and while scrolling. Bit 1: with a zero-copy surface
 // on the panel the boot scanout is offscreen, so the frame is written into it first and the panel flips home after. Bit 2:
 // with the boot scanout on the panel, the frame is written into the surface's own VRAM (its CPU mapping) and that is
-// flipped instead -- never while that surface is the one on the panel or a flip is in flight. Bit 4: the plugin copies
-// such a frame out to system memory only after it has released the surface's pending mark (nvmtl_ws_release, then
-// nvmtl_ws_publish_settled), so a swap can get here before the copy, when system memory still holds what the surface
-// showed last time -- seconds or minutes old. The copy-out's write unlock moves the surface's unlock seed, so the frame
-// is shown only once that seed has moved past the one shown last; a frame whose pixels do not arrive keeps the previous
-// picture on the panel. Measured with DTrace on an RTX 2080 at 4K: the swap arrives, the plugin's write lock follows 1-3 ms
-// later and its unlock 20-23 ms later (the first copy-out of a session 124 ms later), while the old code had read the
-// surface within 6-10 ms in all 59 frames. 0 = the upstream behaviour.
-static int gIopUnwrittenFix = 7;
+// flipped instead -- never while that surface is the one on the panel or a flip is in flight. 0 = the upstream behaviour.
+// Bit 2 did not stop the flash: such a frame reached this transaction before the plugin had copied it out, so the system
+// memory still held what the surface showed the last time it was used (DTrace, RTX 2080 at 4K: the plugin releases the
+// surface's pending mark 1-4 ms after the present and copies 4-12 ms after that; samples of the system memory taken at the
+// present matched the previous copy-out in all 102 frames). Waiting for the copy-out here cannot work either: the copy-out
+// locks the surface, that lock takes the accelerator lock, and the accelerator's transaction-interrupt thread
+// (display_post_transaction_interrupt) holds the accelerator lock while it waits for this workloop's gate. The same cycle
+// made the 100 ms nvSurfWaitReady timeouts on these frames: a WindowServer escape waiting for the accelerator lock held the
+// NVRM escape lock that the plugin's release had to pass. Bit 8: the frame is handed to the asynchronous flip worker and
+// this transaction returns at once; off the gate the worker waits for the plugin's release and the copy-out after it,
+// writes the frame into the surface's own VRAM and flips that (nvAccelIopRunUnwritten). debug.nvaccel_iop_uw_log=N logs
+// the next N such frames in detail.
+static int gIopUnwrittenFix = 9;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_unwritten_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopUnwrittenFix, 0,
-           "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM and flip them, 4 = wait for the plugin's copy-out (unlock seed) and keep stale frames off the panel, 0 = upstream");
+           "NullMoth fork: 1 = write copied frames offscreen and flip home after, 2 = upload unwritten frames into their own VRAM in the transaction (shows the previous copy-out), 8 = show unwritten frames from the async worker once the plugin's copy-out has landed, 0 = upstream");
 static SInt64 gCntIopHomeAfterCopy, gCntIopUnwrittenUpload, gCntIopUnwrittenUploadUs, gCntIopUnwrittenNoKva;
 static unsigned gIopUploadSlowRuns;
 static bool gIopUploadSlow;
 extern "C" {
-uint32_t _ZNK9IOSurface11getLockSeedEv(void *surface);
+uint32_t _ZNK9IOSurface11getLockSeedEv(void *surface);    // plain field reads (IOSurface +0x178 -> +0xc / +0x10), no lock
 uint32_t _ZNK9IOSurface13getUnlockSeedEv(void *surface);
 }
-enum { kIopUwSlots = 4, kIopUwWaitMs = 50, kIopUwFirstWaitMs = 150 };   // a copy-out took 20-23 ms, a session's first one 124 ms
-struct NVIopUwSeen { unsigned id; uint32_t seed; };   // an unwritten surface and the unlock seed it was last shown at
-static NVIopUwSeen gIopUwSeen[kNvMaxFB][kIopUwSlots];
-static unsigned gIopUwNext[kNvMaxFB];
-static SInt64 gCntIopUwFresh, gCntIopUwStaleKept, gCntIopUwWaits, gCntIopUwWaitMs, gCntIopUwChecked;
+// NullMoth fork (bit 8): surfaces that reached a transaction as unwritten frames, with the plugin's pending marks and
+// releases of each, in escape order (nvIopUwOnMark). The plugin copies such a surface out to system memory on the same
+// thread right after its release, so the copy-out has landed once the unlock seed has moved past its value at that release
+// and no write lock is open (a write lock moves the lock seed; its unlock brings the unlock seed level). The table holds no
+// reference on any surface: ptr only tells a reused id apart, and such an entry starts over.
+// markGen counts pending marks, so a release that read the seed while a newer mark came in leaves that mark set.
+// Read-only locks move neither seed (IOSurface::lockSurface / unlockSurface, macOS 15.7).
+struct NVIopUwTrack { IOSurface *ptr; unsigned id; unsigned rel, markGen; uint32_t relSeed; bool pend, known; uint64_t use; };
+struct NVIopUwSnap { unsigned rel; uint32_t relSeed; bool pend, known, first; };
+enum { kIopUwTrack = 16, kIopUwBoundMs = 100, kIopUwGraceMs = 20, kIopUwLockTries = 20, kIopUwSlowUs = 25000, kIopUwTimeoutsOff = 8 };
+static NVIopUwTrack gIopUwTrack[kIopUwTrack];
+static uint64_t gIopUwTrackTick;
+static IOLock *gIopUwTrackLock;
+static uint64_t gIopFlipAt[kNvMaxFB];            // when the panel last took a flip (or went home): the surface it left is
+                                                 // scanned until that flip lands
+static volatile SInt32 gIopDirectGen[kNvMaxFB];  // frames put on the panel without the asynchronous queue
+static int gIopUwLog = 0;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_uw_log, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopUwLog, 0,
+           "NullMoth fork: log the next N unwritten frames the async worker handles, in detail");
+static SInt64 gCntIopUwDeferred, gCntIopUwShown, gCntIopUwImmediate, gCntIopUwSuperseded, gCntIopUwTimeout,
+              gCntIopUwInvalid, gCntIopUwWaitUs, gCntIopUwMapUs, gCntIopUwUploadUs, gCntIopUwReleases, gCntIopUwMarks,
+              gCntIopUwLockBusy;
+static unsigned gIopUwSlowRun, gIopUwTimeoutRun;   // worker only: slow VRAM writes and timeouts in a row (bit 8 turns off)
+static IOLock *nvIopUwTrackLock()
+{
+    if (!gIopUwTrackLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopUwTrackLock)) IOLockFree(l); }
+    return gIopUwTrackLock;
+}
+// s's tracked state, read in one piece. add: start tracking s (least recently used slot); o->first: no history before now.
+static bool nvIopUwTrackSnap(IOSurface *s, unsigned id, bool add, NVIopUwSnap *o)
+{
+    IOLock *l = nvIopUwTrackLock();
+    if (!l || !s || !id) return false;
+    IOLockLock(l);
+    unsigned k = kIopUwTrack;
+    for (unsigned i = 0; i < kIopUwTrack; i++) if (gIopUwTrack[i].id == id) { k = i; break; }
+    bool first = false;
+    if (k < kIopUwTrack && gIopUwTrack[k].ptr != s) first = true;   // the id names another surface now
+    else if (k == kIopUwTrack) {
+        first = true;
+        k = 0;
+        for (unsigned i = 1; i < kIopUwTrack; i++) if (gIopUwTrack[i].use < gIopUwTrack[k].use) k = i;
+    }
+    if (first && !add) { IOLockUnlock(l); return false; }
+    NVIopUwTrack *t = &gIopUwTrack[k];
+    if (first) { t->ptr = s; t->id = id; t->rel = 0; t->markGen = 0; t->relSeed = 0; t->pend = false; t->known = false; }
+    t->use = ++gIopUwTrackTick;
+    o->rel = t->rel; o->relSeed = t->relSeed; o->pend = t->pend; o->known = t->known; o->first = first;
+    IOLockUnlock(l);
+    return true;
+}
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -1297,8 +1347,12 @@ static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 class NVVidMemory;
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, bool uploaded = false,
-                           NVVidMemory **unwrittenVm = nullptr, unsigned long long *unwrittenBytes = nullptr);
+                           NVVidMemory **unwrittenVm = nullptr, unsigned long long *unwrittenBytes = nullptr,
+                           struct NVRMFlipRequest *unwrittenFlip = nullptr);
 static bool nvAccelIopPanelOnSurface(unsigned head, IOSurface *s);
+static bool nvAccelIopDeferUnwritten(void *pipe, IOService *fb, unsigned head, IOSurface *s, NVVidMemory *vm,
+                                     unsigned long long bytes, const struct NVRMFlipRequest *f);
+static bool nvSurfIsPending(unsigned int id);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
@@ -1330,6 +1384,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
     }
     NVVidMemory *uvm = nullptr; unsigned long long ubytes = 0;   // set when the surface's VRAM was never written by the plugin
+    struct NVRMFlipRequest uf;                                    // and the flip of that VRAM, once a frame is written into it
+    for (unsigned i = 0; i < sizeof uf; i++) ((volatile unsigned char *)&uf)[i] = 0;
     if (!s && vm && vm->fKva) {
         const unsigned char *rr = (const unsigned char *)res;
         w     = *(const volatile unsigned short *)(rr + 0xb0);
@@ -1338,44 +1394,22 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this, false, &uvm, &ubytes)) {
+    } else if (s && nvAccelIopFlip(fb, head, s, this, false, &uvm, &ubytes, &uf)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
+        // NullMoth fork (gIopUnwrittenFix bit 8): a frame the plugin had not written yet goes to the asynchronous worker,
+        // which shows it once the plugin's copy-out has landed; this transaction does not wait for anything.
+        if (uvm && (gIopUnwrittenFix & 8) && nvAccelIopDeferUnwritten(this, fb, head, s, uvm, ubytes, &uf)) {
+            OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+            return kIOReturnSuccess;
+        }
         // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
         nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
-        if (uvm && (gIopUnwrittenFix & 4)) {   // NullMoth fork: wait for the plugin's copy-out of this frame (gIopUnwrittenFix)
-            const unsigned sid = s->getSurfaceID();
-            NVIopUwSeen *e = nullptr;
-            for (unsigned i = 0; i < kIopUwSlots; i++) if (gIopUwSeen[head][i].id == sid) { e = &gIopUwSeen[head][i]; break; }
-            const bool known = e != nullptr;
-            if (!e) { e = &gIopUwSeen[head][gIopUwNext[head]++ % kIopUwSlots]; e->id = sid; e->seed = 0; }
-            const uint32_t lock0 = _ZNK9IOSurface11getLockSeedEv((void *)s), seed0 = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
-            uint32_t seed = seed0;
-            bool fresh = known && seed0 != e->seed;
-            unsigned waited = 0;
-            const unsigned bound = known ? kIopUwWaitMs : kIopUwFirstWaitMs;
-            const uint64_t w0 = mach_absolute_time();
-            uint64_t wns = 0;
-            while (!fresh && wns < bound * 1000000ull) {
-                IOSleep(1);
-                seed = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
-                if (seed != seed0) fresh = true;
-                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &wns);
-            }
-            waited = (unsigned)(wns / 1000000ull);
-            if (wns) { OSAddAtomic64(1, &gCntIopUwWaits); OSAddAtomic64((SInt64)waited, &gCntIopUwWaitMs); }
-            if (OSAddAtomic64(1, &gCntIopUwChecked) < 8)
-                ALOG("iop: unwritten-fix: surface 0x%x lock seed %u unlock seed %u (shown %u%s), waited %u ms -> %s", sid, lock0, seed0,
-                     e->seed, known ? "" : ", first sight", waited, fresh ? "fresh" : "stale, kept off the panel");
-            e->seed = seed;
-            if (!fresh) { OSAddAtomic64(1, &gCntIopUwStaleKept); return kIOReturnSuccess; }   // the panel keeps its picture
-            if (fresh) OSAddAtomic64(1, &gCntIopUwFresh);
-        }
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -1440,6 +1474,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         const SInt64 nh2 = OSAddAtomic64(1, &gCntIopHomeAfterCopy);
         if (nh2 < 3) ALOG("iop: unwritten-fix: frame written into the offscreen boot scanout, then flipped home (head %u)", head);
     }
+    // NullMoth fork: on the panel without the asynchronous queue -- once the panel is home (a HOME left busy did not get there)
+    if (!nvAccelIopPanelOnSurface(head, nullptr)) OSIncrementAtomic(&gIopDirectGen[head]);
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
@@ -1548,10 +1584,18 @@ NVACCEL_CNT(nvaccel_iop_home_after_copy,     gCntIopHomeAfterCopy,     "NullMoth
 NVACCEL_CNT(nvaccel_iop_unwritten_upload,    gCntIopUnwrittenUpload,   "NullMoth fork: unwritten frames written into their own VRAM and flipped");
 NVACCEL_CNT(nvaccel_iop_unwritten_upload_us, gCntIopUnwrittenUploadUs, "NullMoth fork: microseconds those writes took");
 NVACCEL_CNT(nvaccel_iop_unwritten_nokva,     gCntIopUnwrittenNoKva,    "NullMoth fork: unwritten frames whose VRAM has no CPU mapping (they go through the boot scanout)");
-NVACCEL_CNT(nvaccel_iop_unwritten_fresh,     gCntIopUwFresh,           "NullMoth fork: unwritten frames shown after the plugin's copy-out moved the unlock seed");
-NVACCEL_CNT(nvaccel_iop_unwritten_stale_kept, gCntIopUwStaleKept,      "NullMoth fork: unwritten frames kept off the panel: no copy-out arrived in time, system memory held an old frame");
-NVACCEL_CNT(nvaccel_iop_unwritten_waits,     gCntIopUwWaits,           "NullMoth fork: unwritten frames that waited for the copy-out");
-NVACCEL_CNT(nvaccel_iop_unwritten_wait_ms,   gCntIopUwWaitMs,          "NullMoth fork: milliseconds those waits took");
+NVACCEL_CNT(nvaccel_iop_uw_deferred,   gCntIopUwDeferred,   "NullMoth fork: unwritten frames handed to the asynchronous worker");
+NVACCEL_CNT(nvaccel_iop_uw_shown,      gCntIopUwShown,      "NullMoth fork: of those, shown once the plugin's copy-out had landed");
+NVACCEL_CNT(nvaccel_iop_uw_immediate,  gCntIopUwImmediate,  "NullMoth fork: of the shown, those whose copy-out had landed before the worker looked");
+NVACCEL_CNT(nvaccel_iop_uw_superseded, gCntIopUwSuperseded, "NullMoth fork: skipped because a newer frame reached the panel or its queue first");
+NVACCEL_CNT(nvaccel_iop_uw_timeout,    gCntIopUwTimeout,    "NullMoth fork: skipped because no release or copy-out landed within 100 ms");
+NVACCEL_CNT(nvaccel_iop_uw_invalid,    gCntIopUwInvalid,    "NullMoth fork: skipped because the surface's VRAM changed, was on the panel or would not map");
+NVACCEL_CNT(nvaccel_iop_uw_wait_us,    gCntIopUwWaitUs,     "NullMoth fork: microseconds from present to flip, frames shown");
+NVACCEL_CNT(nvaccel_iop_uw_map_us,     gCntIopUwMapUs,      "NullMoth fork: microseconds mapping system memory for those frames");
+NVACCEL_CNT(nvaccel_iop_uw_upload_us,  gCntIopUwUploadUs,   "NullMoth fork: microseconds writing those frames into VRAM (accelerator lock held)");
+NVACCEL_CNT(nvaccel_iop_uw_releases,   gCntIopUwReleases,   "NullMoth fork: the plugin's releases seen on tracked surfaces");
+NVACCEL_CNT(nvaccel_iop_uw_marks,      gCntIopUwMarks,      "NullMoth fork: the plugin's pending marks seen on tracked surfaces");
+NVACCEL_CNT(nvaccel_iop_uw_lockbusy,   gCntIopUwLockBusy,   "NullMoth fork: skipped because the accelerator lock stayed busy for 20 tries");
 // The two decisions the display pipe makes from the family's validity bits, kept as pure functions so they can be
 // exercised outside the kernel (tools/test_iop_flip_gate.py). vramNewest is the family's bit (valid[6] & plane);
 // sysmemCurrent is valid[0] & plane; pluginWrote is nvAccelPluginWrote(): the resource's recorded write cookie equals the
@@ -1637,6 +1681,17 @@ static bool nvSurfWaitReady(unsigned int id)
     }
     return ready;
 }
+// NullMoth fork: whether WindowServer's pending mark on surface id is still set (no wait, no side effect)
+static bool nvSurfIsPending(unsigned int id)
+{
+    IOLock *l = gSurfPendLock;
+    if (!l || !id || !gSurfGpuOn) return false;
+    bool p = false;
+    IOLockLock(l);
+    for (unsigned i = 0; i < 32; i++) if (gSurfPend[i].id == id) { p = true; break; }
+    IOLockUnlock(l);
+    return p;
+}
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "1 = WindowServer swaps wait for GPU completion here (same value as nvaccel_surface_gpu_on)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "0 = WindowServer waits for its own composites again (the plugin re-asks every second)");
 NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks from WindowServer");
@@ -1688,9 +1743,14 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_fix);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_home_after_copy);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload); sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_upload_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_nokva);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_fresh);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_stale_kept);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_waits);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_unwritten_wait_ms);
-    ALOG("NullMoth fork (vgearen): unwritten-frame flash fix compiled in, debug.nvaccel_iop_unwritten_fix=%d", gIopUnwrittenFix);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_deferred);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_shown);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_immediate);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_superseded); sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_timeout);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_invalid);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_wait_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_map_us);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_upload_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_releases);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_marks);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_lockbusy);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_uw_log);
+    ALOG("NullMoth fork (vgearen): unwritten frames shown from the async worker after the plugin's copy-out (C2b), debug.nvaccel_iop_unwritten_fix=%d", gIopUnwrittenFix);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_head);       sysctl_register_oid(&sysctl__debug_nvaccel_crc);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
@@ -1897,20 +1957,54 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
 }
 // The marks arrive through NVK's surface escape (NVRM_ESC_SURF_DIRTY with plane NVRM_SS_PLANE_GPU_MARK | pending): the
 // WindowServer sandbox denies sysctl writes. Only WindowServer's own marks are taken, so no other process can hold a swap.
-static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
+// NullMoth fork (gIopUnwrittenFix bit 8): the plugin marks a surface pending at a commit and releases it once the GPU is
+// done; for a tracked surface its copy-out of the newest pixels follows the release on this thread once the escape
+// returns, so the unlock seed read now is the one that copy-out moves. Kept apart from the kernel's own pending table,
+// whose marks also go on a swap timeout or when it is full. The surface is looked up for the read and let go at once.
+static void nvIopUwOnMark(unsigned id, bool pending, task_t task)
+{
+    IOLock *l = gIopUwTrackLock;
+    if (!l || !id) return;
+    bool tracked = false;
+    unsigned gen = 0;
+    IOLockLock(l);
+    for (unsigned i = 0; i < kIopUwTrack; i++) if (gIopUwTrack[i].id == id) {
+        tracked = true;
+        if (pending) { gIopUwTrack[i].pend = true; gIopUwTrack[i].markGen++; OSAddAtomic64(1, &gCntIopUwMarks); }
+        else gen = gIopUwTrack[i].markGen;
+        break;
+    }
+    IOLockUnlock(l);
+    if (!tracked || pending) return;
+    void *surf = (gNVSVRoot && task) ? _ZN13IOSurfaceRoot13lookupSurfaceEjP4task(gNVSVRoot, id, task) : nullptr;
+    const uint32_t seed = surf ? _ZNK9IOSurface13getUnlockSeedEv(surf) : 0;
+    IOLockLock(l);
+    for (unsigned i = 0; i < kIopUwTrack; i++) if (gIopUwTrack[i].id == id && (!surf || gIopUwTrack[i].ptr == (IOSurface *)surf)) {
+        if (gIopUwTrack[i].markGen == gen) gIopUwTrack[i].pend = false;   // a mark that came in meanwhile stays
+        gIopUwTrack[i].rel++; gIopUwTrack[i].relSeed = seed; gIopUwTrack[i].known = surf != nullptr;
+        OSAddAtomic64(1, &gCntIopUwReleases);
+        break;
+    }
+    IOLockUnlock(l);
+    if (surf) ((OSObject *)surf)->release();
+}
+static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p, task_t task)
 {
     if (!gSurfGpuOn) return NVRM_SS_OFF;
     char nm[32] = { 0 };
     proc_selfname(nm, sizeof nm);
     if (strcmp(nm, "WindowServer")) return NVRM_SS_OFF;
-    if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
+    if (p->surfaceID) {
+        nvIopUwOnMark(p->surfaceID, (p->plane & 1u) != 0, task);   // NullMoth fork: before nvSurfMark wakes the waiters
+        nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
+    }
     return 0;
 }
 static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
     if (p->version == NVRM_SURFSHARE_VERSION && cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_GPU_MARK)) {
         p->hSrcClient = p->hSrcMemory = 0;
-        p->status = nvSurfGpuEscape(p);
+        p->status = nvSurfGpuEscape(p, task);
         return kIOReturnSuccess;
     }
     p->hSrcClient = p->hSrcMemory = 0;
@@ -2158,8 +2252,14 @@ int thread_call_enter(struct thread_call *call);
 }
 // next/nextF: one frame WindowServer presented while the previous flip was still in flight past the bound, taken by
 // the worker as soon as that flip lands (guarded by gIopAsLock, like busy's clearing).
+// NullMoth fork (gIopUnwrittenFix bit 8): uw/j, nextUw/nextJ: the frame is one the plugin had not written when it was
+// presented (nvAccelIopRunUnwritten). deferring: set from the moment such a frame is handed over until the worker is done
+// with it; a present then queues at once instead of waiting for the worker (it holds the gate the copy-out can need).
+struct NVIopUwJob { NVVidMemory *vm; unsigned long long bytes, cookie; uint64_t t0; unsigned rel0; uint32_t useed0;
+                    SInt32 directGen; bool pend0, first; };
 struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call;
-                    IOSurface *next; struct NVRMFlipRequest nextF; };
+                    IOSurface *next; struct NVRMFlipRequest nextF;
+                    bool uw, nextUw; struct NVIopUwJob j, nextJ; volatile SInt32 deferring; };
 static NVIopAsync gIopAs[kNvMaxFB];
 static SInt32 gIopAsyncRefuseRun;
 // WindowServer's next present waits here while the previous asynchronous flip is still on its way to the panel. It
@@ -2191,12 +2291,168 @@ static bool nvAccelIopAsyncBusy(const void *pipe)
         if (gIopAs[h].pipe == pipe && __atomic_load_n(&gIopAs[h].busy, __ATOMIC_ACQUIRE)) return true;
     return false;
 }
+// NullMoth fork (gIopUnwrittenFix bit 8): a newer frame replaces the deferred one -- a present queued behind it that the
+// panel can take at once (a deferred present queued behind it waits its turn instead), or a frame that reached the panel
+// without the queue (copied, or flipped synchronously).
+static bool nvAccelIopUwSuperseded(NVIopAsync *e, unsigned head, const NVIopUwJob *j)
+{
+    if (__atomic_load_n(&gIopDirectGen[head], __ATOMIC_ACQUIRE) != j->directGen) return true;
+    return __atomic_load_n(&e->next, __ATOMIC_ACQUIRE) != nullptr && !__atomic_load_n(&e->nextUw, __ATOMIC_ACQUIRE);
+}
+// NullMoth fork (gIopUnwrittenFix bit 8): the worker's half of an unwritten frame. Off the display pipe's gate it waits for
+// the plugin's release of the surface and the copy-out that follows it, writes the frame into the surface's own VRAM and
+// flips that. Returns true when the frame went on the panel (the reference on s then belongs to gIopFlipFront); otherwise
+// it releases s and the panel keeps its picture. e->deferring stays set until the queue hands over the next frame.
+// Eight timeouts in a row (the release or copy-out the frames wait for is not seen at all) or three VRAM writes in a row
+// over 25 ms turn bit 8 off (nvAccelIopUwOff): unwritten frames are then copied in the transaction again (bit 1).
+static void nvAccelIopUwOff(const char *what)
+{
+    if (!(gIopUnwrittenFix & 8)) return;
+    gIopUnwrittenFix = gIopUnwrittenFix & ~8;
+    ALOG("iop: unwritten-fix: %s -- debug.nvaccel_iop_unwritten_fix=%d, unwritten frames are copied in the transaction again",
+         what, gIopUnwrittenFix);
+}
+static bool nvAccelIopRunUnwritten(NVIopAsync *e, unsigned head, IOSurface *s)
+{
+    const NVIopUwJob j = e->j;
+    const unsigned sid = s->getSurfaceID();
+    uint64_t deadline = 0, grace = 0;
+    clock_interval_to_deadline(kIopUwBoundMs, kMillisecondScale, &deadline);
+    clock_interval_to_deadline(kIopUwGraceMs, kMillisecondScale, &grace);
+    int why = 0;   // 0 shown, 1 superseded, 2 no release or copy-out, 3 VRAM changed / on the panel / unmapped, 4 flip kept or
+                   // refused, 5 accelerator lock busy
+    bool immediate = true, wrote = false;
+    NVIopUwSnap n; nvSVZero(&n, sizeof n);
+    uint32_t ls = 0, us = 0;
+    for (;;) {
+        if (nvAccelIopUwSuperseded(e, head, &j)) { why = 1; break; }
+        if (!nvIopUwTrackSnap(s, sid, false, &n)) { why = 3; break; }
+        ls = _ZNK9IOSurface11getLockSeedEv((void *)s); us = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
+        const bool writing = ls != us;
+        // the release that covers this frame: one after the present when its mark was still set, else the last one. A
+        // surface seen for the first time took that mark from the kernel's table; the mark gone from there while no release
+        // was counted here means the release came before the surface was tracked.
+        const bool released = j.pend0 ? (n.rel != j.rel0 || (j.first && !nvSurfIsPending(sid))) : true;
+        bool ready = false;
+        if (released && !writing) {
+            if (n.known && (j.pend0 || !j.first)) ready = us != n.relSeed;     // the copy-out after that release has landed
+            else if (j.pend0) ready = us != j.useed0;                           // released after the present, seed not read
+            else ready = us != j.useed0 || mach_absolute_time() >= grace;       // first sight, released before the present
+        }
+        if (ready) break;
+        immediate = false;
+        // Past the bound the release or the copy-out this frame needs has not landed (or a write lock is still open): system
+        // memory holds an older frame -- the flash this is here to stop -- so the frame is skipped.
+        if (mach_absolute_time() >= deadline) { why = 2; break; }
+        IOSleep(1);
+    }
+    // its VRAM: not while the panel scans it -- on the panel now, or the panel left it less than a refresh and a quarter ago
+    while (!why) {
+        if (nvAccelIopPanelOnSurface(head, s)) { why = 3; break; }
+        const uint64_t at = __atomic_load_n(&gIopFlipAt[head], __ATOMIC_ACQUIRE);
+        if (!at || (gIopFlipPrev[head] != s && gIopFlipFront[head] != s)) break;
+        uint64_t sns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - at, &sns);
+        if (sns >= nvAccelFlipWaitUs(e->fb) * 1000ull) break;
+        if (nvAccelIopUwSuperseded(e, head, &j)) { why = 1; break; }
+        IOSleep(1);
+    }
+    const unsigned long long H = e->f.height, P = e->f.pitch;
+    IOMemoryDescriptor *md = nullptr; IOMemoryMap *map = nullptr; const volatile unsigned int *src = nullptr;
+    uint64_t t1 = mach_absolute_time(), mns = 0, uns = 0;
+    if (!why) {   // system memory, mapped for this frame only: nothing of s outlives the frame here
+        md = s->getMemoryDescriptor();
+        if (!H || !md || md->getLength() < H * P || md->prepare() != kIOReturnSuccess) { md = nullptr; why = 3; }
+    }
+    if (!why) {
+        map = md->map(kIOMapReadOnly);
+        if (map && map->getLength() >= H * P) src = (const volatile unsigned int *)map->getVirtualAddress(); else why = 3;
+    }
+    absolutetime_to_nanoseconds(mach_absolute_time() - t1, &mns);
+    // VRAM is backed and freed under the accelerator lock (deallocPhysical clears fKva even when it parks the memory), so it
+    // is checked, its mapping read once, and written with that lock held. The lock is only tried, a millisecond apart:
+    // this thread never sleeps on it, whatever holds it, and a frame that does not get it in 20 tries is skipped. Held,
+    // the plugin's next IOSurfaceLock waits at most one copy.
+    NVAccel *a = NVAccel::gAccel;
+    bool locked = false;
+    if (!why && !a) why = 3;
+    for (unsigned i = 0; !why; i++) {
+        if (nvFamLock(a, true)) { locked = true; break; }
+        if (i + 1 >= kIopUwLockTries) why = 5;
+        else if (nvAccelIopUwSuperseded(e, head, &j)) why = 1;
+        else IOSleep(1);
+    }
+    // the same VRAM as at the present, still mapped, and not written by the plugin since (its pixels would be newer)
+    NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr, *kva = nullptr; unsigned long long bytes = 0;
+    if (!why && (!nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes) || !res || vm != j.vm || kmem != e->f.kapiMemory
+                 || vm->fAllocationCookie != j.cookie || !(kva = vm->fKva) || H * P > bytes
+                 || nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) why = 3;
+    if (!why) {
+        const uint64_t t2 = mach_absolute_time();
+        const unsigned long long nw = (H * P) / 4;
+        volatile unsigned int *dv = (volatile unsigned int *)kva;
+        for (unsigned long long i = 0; i < nw; i++) dv[i] = src[i];
+        absolutetime_to_nanoseconds(mach_absolute_time() - t2, &uns);
+        wrote = true;
+    }
+    if (locked) nvFamUnlock(a);
+    if (map) map->release();
+    if (md) md->complete();
+    // a newer frame can have reached the panel during the write; flipping this one now would put the panel back
+    if (!why && (nvAccelIopUwSuperseded(e, head, &j) || nvAccelIopPanelOnSurface(head, s))) why = 1;
+    bool shown = false;
+    if (!why) {
+        const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+        IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+        if (sym) sym->release();
+        const int outcome = nvAccelFlipOutcome(rr);
+        if (outcome == kNvFlipShown) {
+            if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
+            gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
+            __atomic_store_n(&gIopFlipAt[head], mach_absolute_time(), __ATOMIC_RELEASE);
+            OSAddAtomic64(1, &gCntIopFlip); OSAddAtomic64(1, &gCntIopAsync);
+            shown = true;
+        } else {
+            OSAddAtomic64(1, outcome == kNvFlipKept ? &gCntIopLate : &gCntIopAsyncRefused);
+            why = 4;
+        }
+    }
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - j.t0, &ns);
+    OSAddAtomic64((SInt64)(mns / 1000), &gCntIopUwMapUs); OSAddAtomic64((SInt64)(uns / 1000), &gCntIopUwUploadUs);
+    if (shown) {
+        const SInt64 c = OSAddAtomic64(1, &gCntIopUwShown);
+        OSAddAtomic64((SInt64)(ns / 1000), &gCntIopUwWaitUs);
+        if (immediate) OSAddAtomic64(1, &gCntIopUwImmediate);
+        if (c < 3) ALOG("iop: unwritten-fix: surface 0x%x shown %llu us after its present (copy-out %s), %llu us to map, %llu us to write into VRAM",
+                        sid, ns / 1000, immediate ? "had landed" : "awaited", mns / 1000, uns / 1000);
+    } else if (why == 1) OSAddAtomic64(1, &gCntIopUwSuperseded);
+    else if (why == 2) OSAddAtomic64(1, &gCntIopUwTimeout);
+    else if (why == 3) OSAddAtomic64(1, &gCntIopUwInvalid);
+    else if (why == 5) OSAddAtomic64(1, &gCntIopUwLockBusy);
+    if (gIopUwLog > 0) {
+        gIopUwLog--;
+        ALOG("iop: uw: surface 0x%x %s %llu us after its present: pend0 %d first %d rel %u->%u known %d relSeed %u useed0 %u lock/unlock %u/%u, map %llu us, write %llu us",
+             sid, shown ? "SHOWN" : why == 1 ? "superseded" : why == 2 ? "TIMED-OUT" : why == 3 ? "INVALID"
+                  : why == 5 ? "LOCK-BUSY" : "FLIP-KEPT/REFUSED",
+             ns / 1000, (int)j.pend0, (int)j.first, j.rel0, n.rel, (int)n.known, n.relSeed, j.useed0, ls, us, mns / 1000, uns / 1000);
+    }
+    // the guards; only this worker counts either run
+    if (why == 2) { if (++gIopUwTimeoutRun >= kIopUwTimeoutsOff) { gIopUwTimeoutRun = 0; nvAccelIopUwOff("8 unwritten frames in a row saw no release or copy-out within 100 ms"); } }
+    else if (shown) gIopUwTimeoutRun = 0;
+    if (wrote) {
+        if (uns <= kIopUwSlowUs * 1000ull) gIopUwSlowRun = 0;
+        else if (++gIopUwSlowRun >= 3) { gIopUwSlowRun = 0; nvAccelIopUwOff("3 VRAM writes in a row took over 25 ms"); }
+    }
+    if (!shown) ((OSObject *)s)->release();
+    return shown;
+}
 static void nvAccelIopAsyncRun(void *p0, void *)
 {
     NVIopAsync *e = (NVIopAsync *)p0;
     const unsigned head = (unsigned)(e - gIopAs);
     IOSurface *s = e->s; e->s = nullptr;
+    void *jpipe = e->pipe; IOService *jfb = e->fb;   // NullMoth fork: held by nvAccelIopAsyncStart until this run ends
   again:
+    if (e->uw) { e->uw = false; (void)nvAccelIopRunUnwritten(e, head, s); } else {   // NullMoth fork (bit 8)
     nvSurfWaitReady(s->getSurfaceID());   // WindowServer did not wait for this composite; the flip does, off its thread
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
@@ -2206,6 +2462,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
         gIopAsyncRefuseRun = 0;
         if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
         gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
+        __atomic_store_n(&gIopFlipAt[head], mach_absolute_time(), __ATOMIC_RELEASE);   // NullMoth fork
         const SInt64 n = OSAddAtomic64(1, &gCntIopFlip); OSAddAtomic64(1, &gCntIopAsync);
         if (n < 4 || n == 600 || (n & 0xffff) == 0)
             ALOG("iop: ASYNC swap #%lld head %u: surface 0x%x %ux%u pitch %u scanned out of its own VRAM (flipResult %d)",
@@ -2223,32 +2480,49 @@ static void nvAccelIopAsyncRun(void *p0, void *)
         }
         ((OSObject *)s)->release();
     }
+    }   // NullMoth fork (bit 8): end of the ordinary flip
     // A frame queued behind this flip follows it at once; otherwise the worker is free and the waiter is woken.
+    // NullMoth fork (bit 8): deferring changes only here, with the queue lock held, so no present waits for the worker
+    // between a deferred frame and the frame after it (or the worker's end).
     IOSurface *queued = nullptr;
     if (gIopAsLock) {
         IOLockLock(gIopAsLock);
         queued = e->next; e->next = nullptr;
-        if (queued) { for (unsigned i = 0; i < sizeof e->f; i++) ((volatile unsigned char *)&e->f)[i] = ((const volatile unsigned char *)&e->nextF)[i]; }
-        else { __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE); IOLockWakeup(gIopAsLock, (event_t)&e->busy, false); }
+        if (queued) {
+            for (unsigned i = 0; i < sizeof e->f; i++) ((volatile unsigned char *)&e->f)[i] = ((const volatile unsigned char *)&e->nextF)[i];
+            e->uw = e->nextUw; e->j = e->nextJ; e->nextUw = false;
+            __atomic_store_n(&e->deferring, e->uw ? 1 : 0, __ATOMIC_RELEASE);
+            if (e->uw) IOLockWakeup(gIopAsLock, (event_t)&e->busy, false);
+        }
+        else {
+            __atomic_store_n(&e->deferring, 0, __ATOMIC_RELEASE); __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
+            IOLockWakeup(gIopAsLock, (event_t)&e->busy, false);
+        }
         IOLockUnlock(gIopAsLock);
     } else {
-        __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->deferring, 0, __ATOMIC_RELEASE); __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
     }
-    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
+    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(jpipe, nullptr);
     if (queued) { s = queued; goto again; }
+    if (jpipe) ((OSObject *)jpipe)->release();   // NullMoth fork: the references nvAccelIopAsyncStart took for this run
+    if (jfb) jfb->release();
 }
-static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f)
+static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f,
+                                 const struct NVIopUwJob *uj = nullptr)
 {
     NVIopAsync *e = &gIopAs[head];
     if (!gIopAsLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopAsLock)) IOLockFree(l); }
-    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) {
+    // NullMoth fork: a worker deferring an unwritten frame is not waited for -- this thread holds the display pipe's gate,
+    // which that frame's copy-out can need to move (see gIopUnwrittenFix); the frame queues at once instead.
+    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && !__atomic_load_n(&e->deferring, __ATOMIC_ACQUIRE)) {
         uint64_t end = 0; clock_interval_to_deadline((uint32_t)nvAccelFlipWaitUs(fb), kMicrosecondScale, &end);
-        while (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && mach_absolute_time() < end) {
+        while (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && !__atomic_load_n(&e->deferring, __ATOMIC_ACQUIRE)
+               && mach_absolute_time() < end) {
             if (!gIopAsLock) { IOSleep(1); continue; }
             uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
             if (next > end) next = end;
             IOLockLock(gIopAsLock);
-            if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE))
+            if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && !__atomic_load_n(&e->deferring, __ATOMIC_ACQUIRE))
                 IOLockSleepDeadline(gIopAsLock, (event_t)&e->busy, next, THREAD_UNINT);
             IOLockUnlock(gIopAsLock);
         }
@@ -2260,8 +2534,9 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
         if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && e->pipe == pipe && e->fb == fb) {
             IOSurface *old = e->next;
             ((OSObject *)s)->retain();
-            e->next = s;
             for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->nextF)[i] = ((const unsigned char *)f)[i];
+            e->nextUw = uj != nullptr; if (uj) e->nextJ = *uj;
+            __atomic_store_n(&e->next, s, __ATOMIC_RELEASE);
             IOLockUnlock(gIopAsLock);
             if (old) { OSAddAtomic64(1, &gCntIopAsyncDrop); ((OSObject *)old)->release(); }
             return true;
@@ -2275,14 +2550,38 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
     if (!e->call) e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
     if (!e->call) return false;
     ((OSObject *)s)->retain();
+    ((OSObject *)pipe)->retain(); fb->retain();   // NullMoth fork: held until the run ends (a deferred frame can take 100 ms)
     e->pipe = pipe; e->fb = fb; e->s = s;
     for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->f)[i] = ((const unsigned char *)f)[i];
+    e->uw = uj != nullptr; if (uj) e->j = *uj;
+    __atomic_store_n(&e->deferring, uj ? 1 : 0, __ATOMIC_RELEASE);
     __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
     thread_call_enter(e->call);
     return true;
 }
+// NullMoth fork (gIopUnwrittenFix bit 8): performTransaction's half of an unwritten frame. Takes s's tracked state in one
+// piece -- the plugin's releases so far and whether it holds s now (for a surface seen for the first time, the kernel's
+// own pending table is the best guess) -- and hands the frame to the asynchronous worker. Nothing here waits.
+static bool nvAccelIopDeferUnwritten(void *pipe, IOService *fb, unsigned head, IOSurface *s, NVVidMemory *vm,
+                                     unsigned long long bytes, const struct NVRMFlipRequest *f)
+{
+    // the plugin's marks come through nvSurfGpuEscape only while that path is on; without them nothing here could see a release
+    if (!gIopAsync || !gSurfGpuOn || !pipe || !fb || !s || !vm || !f || !f->version || head >= kNvMaxFB || !vm->fKva) return false;
+    const unsigned sid = s->getSurfaceID();
+    NVIopUwSnap n;
+    if (!nvIopUwTrackSnap(s, sid, true, &n)) return false;
+    struct NVIopUwJob j; nvSVZero(&j, sizeof j);
+    j.vm = vm; j.bytes = bytes; j.cookie = vm->fAllocationCookie; j.t0 = mach_absolute_time();
+    j.rel0 = n.rel; j.first = n.first;
+    j.pend0 = n.first ? nvSurfIsPending(sid) : n.pend;
+    j.useed0 = _ZNK9IOSurface13getUnlockSeedEv((void *)s);
+    j.directGen = __atomic_load_n(&gIopDirectGen[head], __ATOMIC_ACQUIRE);
+    if (!nvAccelIopAsyncStart(pipe, fb, head, s, f, &j)) return false;
+    OSAddAtomic64(1, &gCntIopUwDeferred);
+    return true;
+}
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, bool uploaded,
-                           NVVidMemory **unwrittenVm, unsigned long long *unwrittenBytes)
+                           NVVidMemory **unwrittenVm, unsigned long long *unwrittenBytes, struct NVRMFlipRequest *unwrittenFlip)
 {
     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
     // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
@@ -2320,6 +2619,15 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
             ALOG("iop: surface 0x%x: VRAM marked newest but the plugin never wrote it -- copying its system memory instead of flipping (%lld so far, VRAM CPU mapping %s)",
                  s->getSurfaceID(), (long long)n + 1, vm->fKva ? "yes" : "no");
         if (unwrittenVm) { *unwrittenVm = vm; if (unwrittenBytes) *unwrittenBytes = bytes; }
+        if (unwrittenFlip) {   // NullMoth fork: the flip of this VRAM once the frame is written into it (bit 8)
+            const unsigned long long uW = s->getWidth(), uH = s->getHeight(), uP = s->getBytesPerRow();
+            nvSVZero(unwrittenFlip, sizeof *unwrittenFlip);
+            if (uW && uH && uP >= 4 * uW && uH * uP <= bytes) {
+                unwrittenFlip->version = NVRM_FLIP_ABI_VERSION; unwrittenFlip->kapiMemory = kmem;
+                unwrittenFlip->allocationCookie = vm->fAllocationCookie;
+                unwrittenFlip->width = (unsigned)uW; unwrittenFlip->height = (unsigned)uH; unwrittenFlip->pitch = (unsigned)uP;
+            }
+        }
         return false;
     }
     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -2340,6 +2648,8 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     ((OSObject *)s)->retain();
     if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
     gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
+    __atomic_store_n(&gIopFlipAt[head], mach_absolute_time(), __ATOMIC_RELEASE);   // NullMoth fork
+    OSIncrementAtomic(&gIopDirectGen[head]);                                        // on the panel without the queue
     const SInt64 n = OSAddAtomic64(1, &gCntIopFlip);
     if (n < 4 || n == 600 || (n & 0xffff) == 0)
         ALOG("iop: zero-copy swap #%lld head %u: surface 0x%x %llux%llu pitch %llu scanned out of its own VRAM (flipResult %d)",
@@ -2376,6 +2686,7 @@ static void nvAccelIopHome(IOService *fb, unsigned head)
     // next copied frame tries again. Clearing the flag here left every later copy offscreen behind that flip.
     if (rr == kIOReturnBusy) return;
     if (rr != kIOReturnSuccess && gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: HOME flip refused (0x%x) head %u", (unsigned)rr, head); }
+    if (rr == kIOReturnSuccess) __atomic_store_n(&gIopFlipAt[head], mach_absolute_time(), __ATOMIC_RELEASE);   // NullMoth fork
     gIopFlipped[head] = false;
 }
 // NullMoth fork: a zero-copy surface is on the panel -- s, or any one when s is null; the boot scanout is then offscreen
